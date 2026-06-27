@@ -17,6 +17,68 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// --- runtime layer skipping (--skip-layers) -------------------------------------------
+// Remap a "blk.<N>." tensor name to compacted numbering, dropping skipped blocks.
+// Returns "" if the tensor belongs to a skipped block (so the caller drops it).
+// Mirrors remap_layer() in src/llama-quant.cpp so the load-time path matches the
+// bake-time --prune-layers path exactly.
+static std::string llama_skip_remap_layer(const std::string & orig_name, const std::vector<int> & prune,
+        std::map<int, std::string> & mapped, int & next_id) {
+    if (prune.empty()) {
+        return orig_name;
+    }
+
+    static const std::regex pattern(R"(blk\.(\d+)\.)");
+    if (std::smatch match; std::regex_search(orig_name, match, pattern)) {
+        const int blk = std::stoi(match[1]);
+        std::string new_name = orig_name;
+
+        if (mapped.count(blk)) {
+            // already mapped
+        } else if (std::find(prune.begin(), prune.end(), blk) != prune.end()) {
+            mapped[blk] = "";
+        } else if (blk < prune.front()) {
+            mapped[blk] = std::to_string(blk);
+            next_id = blk + 1;
+        } else {
+            mapped[blk] = std::to_string(next_id);
+            ++next_id;
+        }
+
+        return mapped[blk].empty() ? mapped[blk] : new_name.replace(match.position(1), match.length(1), mapped[blk]);
+    }
+
+    return orig_name;
+}
+
+// Compact a per-layer hparams array KV (e.g. "<arch>.attention.head_count") to the kept
+// subset, in place. No-op when the key is absent or stored as a scalar (the common case).
+// Without this, get_key_or_arr would throw on array-valued models after block_count shrinks.
+static void llama_skip_compact_array_kv(struct gguf_context * meta, const std::string & key,
+        const std::vector<int> & prune, uint32_t orig_n_layer) {
+    const int kid = gguf_find_key(meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_ARRAY) {
+        return;
+    }
+    const enum gguf_type at = gguf_get_arr_type(meta, kid);
+    if (at != GGUF_TYPE_INT32 && at != GGUF_TYPE_UINT32) {
+        return; // only the integer per-layer arrays are relevant here
+    }
+    const size_t n = gguf_get_arr_n(meta, kid);
+    if (n != (size_t) orig_n_layer) {
+        return; // not a per-layer array we recognize
+    }
+    const int32_t * src = (const int32_t *) gguf_get_arr_data(meta, kid);
+    std::vector<int32_t> kept;
+    kept.reserve(n);
+    for (uint32_t i = 0; i < orig_n_layer; ++i) {
+        if (std::find(prune.begin(), prune.end(), (int) i) == prune.end()) {
+            kept.push_back(src[i]);
+        }
+    }
+    gguf_set_arr_data(meta, key.c_str(), at, kept.data(), kept.size());
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -519,7 +581,8 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const int32_t * skip_layers)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -698,6 +761,103 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
+
+    // runtime layer skipping (--skip-layers): drop the listed blocks in memory so the
+    // model loads as if it had been pruned at bake time. Mirrors src/llama-quant.cpp.
+    if (skip_layers != nullptr && skip_layers[0] != -1) {
+        std::vector<int> prune_list;
+        for (const int32_t * p = skip_layers; *p != -1; ++p) {
+            prune_list.push_back(*p);
+        }
+        std::sort(prune_list.begin(), prune_list.end());
+        prune_list.erase(std::unique(prune_list.begin(), prune_list.end()), prune_list.end());
+
+        const int bc_kid = gguf_find_key(metadata, llm_kv(LLM_KV_BLOCK_COUNT).c_str());
+        const uint32_t orig_n_layer = bc_kid >= 0 ? gguf_get_val_u32(metadata, bc_kid) : 0;
+
+        // refuse architectures whose per-layer structure is computed from the index
+        // (recurrent/hybrid attention, MTP/NextN tails, sliding-window patterns).
+        // Compacting indices would mismatch kept layers against recomputed types.
+        auto has_key = [&](enum llm_kv k) { return gguf_find_key(metadata, llm_kv(k).c_str()) >= 0; };
+        const bool index_computed_arch =
+            has_key(LLM_KV_NEXTN_PREDICT_LAYERS) ||
+            has_key(LLM_KV_FULL_ATTENTION_INTERVAL) ||
+            has_key(LLM_KV_SSM_CONV_KERNEL) ||
+            has_key(LLM_KV_ATTENTION_SLIDING_WINDOW) ||
+            has_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN);
+
+        if (index_computed_arch) {
+            throw std::runtime_error(format(
+                "--skip-layers is not supported for architecture '%s': it computes per-layer "
+                "structure (recurrent/hybrid attention, MTP, or sliding-window) from the layer "
+                "index, which contiguous skipping would corrupt. Supported: standard dense decoder stacks.",
+                arch_name.c_str()));
+        }
+        if (orig_n_layer == 0) {
+            throw std::runtime_error("--skip-layers: could not determine block_count for this model");
+        }
+
+        // validation: protect the final block and drop out-of-range indices (warn, don't abort).
+        std::vector<int> valid;
+        for (int id : prune_list) {
+            if (id >= (int) orig_n_layer) {
+                LLAMA_LOG_WARN("%s: --skip-layers: ignoring out-of-range layer %d (model has %u layers)\n",
+                        __func__, id, orig_n_layer);
+            } else if (id == (int) orig_n_layer - 1) {
+                LLAMA_LOG_WARN("%s: --skip-layers: refusing to skip the final block %d (carries the readout)\n",
+                        __func__, id);
+            } else {
+                valid.push_back(id);
+            }
+        }
+        prune_list = valid;
+
+        if (prune_list.empty()) {
+            LLAMA_LOG_WARN("%s: --skip-layers: no valid layers to skip after validation\n", __func__);
+        } else {
+            const uint32_t reduced_n_layer = orig_n_layer - (uint32_t) prune_list.size();
+            if (reduced_n_layer < 1) {
+                throw std::runtime_error("--skip-layers: refusing to skip all layers");
+            }
+            if (reduced_n_layer < orig_n_layer / 2) {
+                LLAMA_LOG_WARN("%s: --skip-layers: keeping only %u of %u layers (<50%%); quality may degrade sharply\n",
+                        __func__, reduced_n_layer, orig_n_layer);
+            }
+
+            // rebuild weights_map with compacted "blk.<N>." keys, dropping skipped blocks.
+            std::map<int, std::string> mapped;
+            int next_id = 0;
+            std::map<std::string, llama_tensor_weight, weight_name_comparer> remapped;
+            size_t dropped_bytes = 0;
+            for (auto & it : weights_map) {
+                const std::string new_name = llama_skip_remap_layer(it.first, prune_list, mapped, next_id);
+                if (new_name.empty()) {
+                    dropped_bytes += ggml_nbytes(it.second.tensor);
+                    continue; // skipped block: drop the tensor (never allocated)
+                }
+                if (new_name != it.first) {
+                    ggml_set_name(it.second.tensor, new_name.c_str());
+                }
+                remapped.emplace(new_name, it.second);
+            }
+            weights_map = std::move(remapped);
+            n_tensors = weights_map.size();
+
+            // update metadata so load_hparams sees the reduced, contiguous stack.
+            gguf_set_val_u32(metadata, llm_kv(LLM_KV_BLOCK_COUNT).c_str(), reduced_n_layer);
+            llama_skip_compact_array_kv(metadata, llm_kv(LLM_KV_ATTENTION_HEAD_COUNT),    prune_list, orig_n_layer);
+            llama_skip_compact_array_kv(metadata, llm_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV), prune_list, orig_n_layer);
+            llama_skip_compact_array_kv(metadata, llm_kv(LLM_KV_FEED_FORWARD_LENGTH),     prune_list, orig_n_layer);
+            n_kv = gguf_get_n_kv(metadata);
+
+            std::string joined;
+            for (size_t i = 0; i < prune_list.size(); ++i) {
+                joined += (i ? "," : "") + std::to_string(prune_list[i]);
+            }
+            LLAMA_LOG_INFO("%s: --skip-layers: removing %zu block(s) [%s]; n_layer %u -> %u; ~%.2f MiB not allocated\n",
+                    __func__, prune_list.size(), joined.c_str(), orig_n_layer, reduced_n_layer, dropped_bytes / (double) MiB);
+        }
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 

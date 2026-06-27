@@ -1522,6 +1522,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.kv_overrides = params.kv_overrides.data();
     }
 
+    if (params.skip_layers.empty()) {
+        mparams.skip_layers = NULL;
+    } else {
+        // build a -1-terminated array, owned by params for a lifetime >= model load
+        params.skip_layers_terminated = params.skip_layers;
+        params.skip_layers_terminated.push_back(-1);
+        mparams.skip_layers = params.skip_layers_terminated.data();
+    }
+
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {

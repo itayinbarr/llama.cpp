@@ -315,6 +315,12 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // runtime layer skipping: list of original transformer block indices to skip at
+        // load time (their weights are never allocated). Terminated by -1. NULL = none.
+        // The model is loaded as if those blocks had been removed (mirrors the bake-time
+        // llama-quantize --prune-layers, but in memory). The final block is protected.
+        const int32_t * skip_layers;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible

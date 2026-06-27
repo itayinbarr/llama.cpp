@@ -2507,6 +2507,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--skip-layers"}, "L0,L1,L2,...",
+        "runtime layer skipping: comma-separated original transformer block indices to skip at load time.\n"
+        "their weights are never allocated (proportional memory savings); composes with quantization.\n"
+        "indices refer to the original numbering; the final block is protected and cannot be skipped.\n"
+        "example: --skip-layers 20,22,24",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                int id;
+                try {
+                    id = std::stoi(item);
+                } catch (...) {
+                    id = -1;
+                }
+                if (id < 0) {
+                    throw std::invalid_argument(string_format("invalid layer index '%s' for --skip-layers", item.c_str()));
+                }
+                params.skip_layers.push_back(id);
+            }
+            std::sort(params.skip_layers.begin(), params.skip_layers.end());
+            params.skip_layers.erase(std::unique(params.skip_layers.begin(), params.skip_layers.end()), params.skip_layers.end());
+        }
+    ));
+    add_opt(common_arg(
         {"--op-offload"},
         {"--no-op-offload"},
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
