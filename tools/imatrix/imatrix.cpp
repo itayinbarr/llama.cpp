@@ -127,12 +127,12 @@ static void process_tensor_name(const std::string & input, std::string & layer, 
 }
 
 static void compute_statistics(std::vector<tensor_statistics> & tstats, const std::string & name, const Stats & e) {
-    if (e.values.size() % e.counts.size() != 0) {
-        LOG_ERR("%s: activation size mismatch for tensor %s (%zu vs %zu)\n", __func__, name.c_str(), e.counts.size(), e.values.size());
-        return;
-    }
     if (e.counts.empty()) {
         LOG_ERR("%s: there are no activations for tensor %s. The imatrix may be suboptimal\n", __func__, name.c_str());
+        return;
+    }
+    if (e.values.size() % e.counts.size() != 0) {
+        LOG_ERR("%s: activation size mismatch for tensor %s (%zu vs %zu)\n", __func__, name.c_str(), e.counts.size(), e.values.size());
         return;
     }
 
@@ -831,7 +831,8 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
             }
         }
     }
-    m_last_chunk = max_count / (m_params.n_ctx / m_params.n_parallel);
+    const int32_t chunk_size = (m_params.n_parallel > 0) ? (m_params.n_ctx / m_params.n_parallel) : 0;
+    m_last_chunk = chunk_size > 0 ? max_count / chunk_size : 0;
 
     gguf_free(ctx_gguf);
     ggml_free(ctx);
