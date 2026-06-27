@@ -500,6 +500,7 @@ struct common_params {
 
     std::vector<int32_t> skip_layers;            // original block indices to skip at load time (--skip-layers)
     std::vector<int32_t> skip_layers_terminated; // owns the -1-terminated array handed to llama_model_params
+    int32_t skip_layers_budget = 0;              // if >0 and skip_layers empty, take the skip list from <model>.layerinfo.json
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

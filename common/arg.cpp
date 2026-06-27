@@ -2530,6 +2530,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--skip-layers-budget"}, "N",
+        "runtime layer skipping: skip the N least-influential layers, read from the\n"
+        "<model>.layerinfo.json sidecar (produced by 'llama-imatrix --show-statistics').\n"
+        "ignored if --skip-layers is given explicitly.",
+        [](common_params & params, int value) {
+            params.skip_layers_budget = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--op-offload"},
         {"--no-op-offload"},
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),

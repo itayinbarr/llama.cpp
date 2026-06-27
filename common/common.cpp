@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1160,8 +1161,54 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// resolve --skip-layers-budget into an explicit skip list from the <model>.layerinfo.json
+// sidecar (produced by `llama-imatrix --show-statistics`). No-op if a list was given
+// explicitly, the budget is <= 0, or the sidecar is missing/unparsable.
+static void common_resolve_skip_budget(common_params & params) {
+    if (!params.skip_layers.empty() || params.skip_layers_budget <= 0) {
+        return;
+    }
+    const std::string path = params.model.path + ".layerinfo.json";
+    std::ifstream f(path);
+    if (!f) {
+        LOG_WRN("%s: --skip-layers-budget set but no sidecar at %s; skipping no layers\n", __func__, path.c_str());
+        return;
+    }
+    try {
+        const nlohmann::json j = nlohmann::json::parse(f);
+        const std::string key = std::to_string(params.skip_layers_budget);
+        std::vector<int32_t> picks;
+        if (j.contains("recommended_skip") && j["recommended_skip"].contains(key)) {
+            picks = j["recommended_skip"][key].get<std::vector<int32_t>>();
+        } else if (j.contains("layers")) {
+            // derive: rank by descending cossim (ascending Block Influence), drop the final block
+            std::vector<std::pair<int,float>> ls;
+            int max_layer = 0;
+            for (const auto & l : j["layers"]) {
+                const int layer = l.value("layer", -1);
+                ls.emplace_back(layer, l.value("cossim", 0.0f));
+                max_layer = std::max(max_layer, layer);
+            }
+            std::sort(ls.begin(), ls.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+            for (const auto & p : ls) {
+                if ((int) picks.size() >= params.skip_layers_budget) break;
+                if (p.first >= 0 && p.first != max_layer) picks.push_back(p.first);
+            }
+        }
+        std::sort(picks.begin(), picks.end());
+        params.skip_layers = picks;
+        std::string joined;
+        for (size_t i = 0; i < picks.size(); ++i) { joined += (i ? "," : "") + std::to_string(picks[i]); }
+        LOG_INF("%s: --skip-layers-budget %d -> skipping layers [%s] (from %s)\n",
+                __func__, params.skip_layers_budget, joined.c_str(), path.c_str());
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: failed to parse %s: %s; skipping no layers\n", __func__, path.c_str(), e.what());
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    common_resolve_skip_budget(params);
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
