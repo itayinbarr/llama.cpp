@@ -153,6 +153,11 @@ struct llama_hparams {
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 
+    // runtime layer skipping (--skip-layers) for architectures that keep the original
+    // index layout (e.g. qwen35): a skipped layer is a residual pass-through and its
+    // weights / KV / recurrent state are not allocated.
+    std::array<bool, LLAMA_MAX_LAYERS> skip_layer_arr = {};
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;
@@ -298,6 +303,8 @@ struct llama_hparams {
 
     // whether or not the given layer is recurrent (for hybrid models)
     bool is_recurrent(uint32_t il) const;
+
+    bool is_skip(uint32_t il) const { return il < n_layer && skip_layer_arr[il]; }
 
     uint32_t n_pos_per_embd() const;
 

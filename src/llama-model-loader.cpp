@@ -786,7 +786,11 @@ llama_model_loader::llama_model_loader(
             has_key(LLM_KV_ATTENTION_SLIDING_WINDOW) ||
             has_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN);
 
-        if (index_computed_arch) {
+        // qwen35/qwen35moe keep the original index layout but are handled by in-graph
+        // skipping (residual pass-through) + KV/recurrent memory filters instead of compaction.
+        const bool graph_skippable = (arch_name == "qwen35" || arch_name == "qwen35moe");
+
+        if (index_computed_arch && !graph_skippable) {
             throw std::runtime_error(format(
                 "--skip-layers is not supported for architecture '%s': it computes per-layer "
                 "structure (recurrent/hybrid attention, MTP, or sliding-window) from the layer "
@@ -797,6 +801,13 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error("--skip-layers: could not determine block_count for this model");
         }
 
+        if (graph_skippable) {
+            // store the raw list; validation that needs n_layer / the MTP tail happens in
+            // load_hparams, and the actual skipping is in the arch graph + memory filters.
+            skip_layers_graph = prune_list;
+            LLAMA_LOG_INFO("%s: --skip-layers: %zu layer(s) deferred to in-graph skipping for arch '%s'\n",
+                    __func__, prune_list.size(), arch_name.c_str());
+        } else {
         // validation: protect the final block and drop out-of-range indices (warn, don't abort).
         std::vector<int> valid;
         for (int id : prune_list) {
@@ -857,6 +868,7 @@ llama_model_loader::llama_model_loader(
             LLAMA_LOG_INFO("%s: --skip-layers: removing %zu block(s) [%s]; n_layer %u -> %u; ~%.2f MiB not allocated\n",
                     __func__, prune_list.size(), joined.c_str(), orig_n_layer, reduced_n_layer, dropped_bytes / (double) MiB);
         }
+        } // end dense compaction branch
     }
 
     fver = (enum llama_fver) gguf_get_version(metadata);

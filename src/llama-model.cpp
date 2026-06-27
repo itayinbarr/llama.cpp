@@ -1980,11 +1980,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
                         const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+                        // exclude --skip-layers layers so their KV / recurrent state is not allocated
                         filter_attn = [&, n_main](int32_t il) {
-                            return (uint32_t)il < n_main && !hparams.is_recurrent(il);
+                            return (uint32_t)il < n_main && !hparams.is_recurrent(il) && !hparams.is_skip(il);
                         };
                         filter_recr = [&, n_main](int32_t il) {
-                            return (uint32_t)il < n_main && hparams.is_recurrent(il);
+                            return (uint32_t)il < n_main && hparams.is_recurrent(il) && !hparams.is_skip(il);
                         };
                     }
 

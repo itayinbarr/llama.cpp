@@ -25,6 +25,26 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
         for (uint32_t i = 0; i < hparams.n_layer; ++i) {
             hparams.recurrent_layer_arr[i] = (i < n_main) && ((i + 1) % full_attn_interval != 0);
         }
+
+        // runtime layer skipping (--skip-layers): mark layers to pass through in the graph.
+        // The MTP/NextN tail and the final transformer block are protected; full-attention
+        // layers may be skipped but are more disruptive than the redundant linear ones.
+        const uint32_t n_main_last = n_main > 0 ? n_main - 1 : 0;
+        for (int il : ml.skip_layers_graph) {
+            if (il < 0 || (uint32_t) il >= hparams.n_layer) {
+                LLAMA_LOG_WARN("%s: --skip-layers: ignoring out-of-range layer %d\n", __func__, il);
+            } else if ((uint32_t) il >= n_main) {
+                LLAMA_LOG_WARN("%s: --skip-layers: refusing to skip MTP/NextN tail layer %d\n", __func__, il);
+            } else if ((uint32_t) il == n_main_last) {
+                LLAMA_LOG_WARN("%s: --skip-layers: refusing to skip the final transformer block %d\n", __func__, il);
+            } else {
+                hparams.skip_layer_arr[il] = true;
+                if (!hparams.recurrent_layer_arr[il]) {
+                    LLAMA_LOG_WARN("%s: --skip-layers: layer %d is a full-attention layer; skipping it is "
+                            "more disruptive than skipping a linear-attention layer\n", __func__, il);
+                }
+            }
+        }
     }
 
     switch (hparams.n_layer - hparams.nextn_predict_layers) {
@@ -122,7 +142,9 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     };
 
     for (int i = 0; i < (int) n_main; ++i) {
-        load_block_trunk(i, trunk_flags);
+        // skipped layers (--skip-layers) are a residual pass-through; do not allocate weights
+        const int flags = trunk_flags | (hparams.is_skip(i) ? TENSOR_SKIP : 0);
+        load_block_trunk(i, flags);
     }
     for (int i = (int) n_main; i < n_layer; ++i) {
         load_block_mtp(i);
@@ -160,6 +182,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
     for (int il = 0; il < n_transformer_layers; ++il) {
+        // runtime layer skipping (--skip-layers): pass the residual stream through unchanged
+        if (hparams.is_skip(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
