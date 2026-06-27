@@ -684,6 +684,7 @@ struct common_params {
     bool process_output  = false; // collect data for the output tensor
     bool compute_ppl     = true;  // whether to compute perplexity
     bool show_statistics = false; // show imatrix statistics per tensor
+    bool residual_importance = false; // capture residual-stream Block Influence per layer during the pass
     bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params

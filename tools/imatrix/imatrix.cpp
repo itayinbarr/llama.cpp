@@ -68,7 +68,13 @@ public:
     bool load_imatrix_legacy(const char * fname);
     bool load_imatrix(const char * file_name);
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
+
+    // residual-stream Block Influence (--residual-importance)
+    void set_collect_residual(bool b) { m_collect_residual = b; }
+    void write_residual_sidecar(const std::string & model_path) const;
 private:
+    void observe_residual(const struct ggml_tensor * t, int il);
+
     std::unordered_map<std::string, Stats> m_stats;
     common_params                          m_params;
     std::mutex                             m_mutex;
@@ -76,6 +82,20 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+
+    // residual-stream capture (Gromov angular distance d(l,n) over a block of n layers).
+    // For compactness we keep only the last-token residual of each layer of the current
+    // ubatch (L x n_embd floats), then accumulate the angular distance for several block
+    // sizes -- never the full per-token activations of the whole stack.
+    bool                              m_collect_residual = false;
+    int                               m_resid_n_embd     = 0;
+    int                               m_resid_n_layer    = 0;    // highest layer index seen + 1
+    int                               m_resid_last_il    = -1;   // detect ubatch boundary (il resets to 0)
+    std::vector<std::vector<float>>   m_resid_window;            // [il] -> last-token residual for this ubatch
+    // per block size n: angular-distance accumulators indexed by start layer l
+    std::vector<int>                  m_resid_budgets = {1, 2, 4, 8, 12};
+    std::vector<std::vector<double>>  m_resid_dist_sum;          // [b][l] sum of d(l, budgets[b])
+    std::vector<std::vector<int64_t>> m_resid_dist_cnt;          // [b][l] count
 };
 
 // remove any prefix and suffixes from the name
@@ -228,6 +248,16 @@ static void compute_cossim(std::vector<tensor_statistics> & tstats) {
 
 bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
+
+    // residual-stream Block Influence: the per-layer residual output is named "l_out-<il>".
+    if (m_collect_residual && strncmp(t->name, "l_out-", 6) == 0) {
+        if (ask) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        observe_residual(t, atoi(t->name + 6));
+        return true;
+    }
 
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
@@ -406,6 +436,150 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     }
 
     return true;
+}
+
+// Streaming residual-stream angular distance (Gromov et al.): when block il produces its
+// output l_out-<il>, store its last-token residual and accumulate d(l, n) =
+// arccos(cos(x_l, x_{l+n}))/pi for each tracked block size n -- the normalized angle the
+// residual stream turns through across a block of n layers. Only the current ubatch's
+// last-token residuals (L x n_embd) are held in memory, not the full activations.
+void IMatrixCollector::observe_residual(const struct ggml_tensor * t, int il) {
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || il < 0) {
+        return;
+    }
+    const int64_t n_embd = t->ne[0];
+    const int64_t n_tok  = t->ne[1];
+    if (n_embd <= 0 || n_tok <= 0) {
+        return;
+    }
+    m_resid_n_embd = (int) n_embd;
+    m_resid_n_layer = std::max(m_resid_n_layer, il + 1);
+
+    // new ubatch (il restarted) -> the stored window belongs to different tokens, drop it
+    if (il <= m_resid_last_il) {
+        m_resid_window.clear();
+    }
+    m_resid_last_il = il;
+
+    // read just the last token's residual vector (the calibration-sequence boundary)
+    std::vector<float> last((size_t) n_embd);
+    const size_t off = (size_t) (n_tok - 1) * n_embd;
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        memcpy(last.data(), (const float *) t->data + off, n_embd * sizeof(float));
+    } else {
+        ggml_backend_tensor_get(t, last.data(), off * sizeof(float), n_embd * sizeof(float));
+    }
+
+    if ((int) m_resid_window.size() <= il) {
+        m_resid_window.resize(il + 1);
+    }
+    m_resid_window[il] = std::move(last);
+
+    // ensure accumulators are large enough
+    if (m_resid_dist_sum.size() != m_resid_budgets.size()) {
+        m_resid_dist_sum.assign(m_resid_budgets.size(), {});
+        m_resid_dist_cnt.assign(m_resid_budgets.size(), {});
+    }
+
+    auto angdist = [&](const std::vector<float> & a, const std::vector<float> & b) -> double {
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int64_t k = 0; k < n_embd; ++k) {
+            dot += (double) a[k] * b[k];
+            na  += (double) a[k] * a[k];
+            nb  += (double) b[k] * b[k];
+        }
+        if (na <= 0.0 || nb <= 0.0) { return -1.0; }
+        double c = dot / (std::sqrt(na) * std::sqrt(nb));
+        c = std::max(-1.0, std::min(1.0, c));
+        return std::acos(c) / M_PI;
+    };
+
+    for (size_t b = 0; b < m_resid_budgets.size(); ++b) {
+        const int n = m_resid_budgets[b];
+        const int start = il - n;
+        if (start < 0 || (int) m_resid_window.size() <= start || m_resid_window[start].empty()) {
+            continue;
+        }
+        const double d = angdist(m_resid_window[start], m_resid_window[il]);
+        if (d < 0.0) { continue; }
+        if ((int) m_resid_dist_sum[b].size() <= start) {
+            m_resid_dist_sum[b].resize(start + 1, 0.0);
+            m_resid_dist_cnt[b].resize(start + 1, 0);
+        }
+        m_resid_dist_sum[b][start] += d;
+        m_resid_dist_cnt[b][start] += 1;
+    }
+}
+
+void IMatrixCollector::write_residual_sidecar(const std::string & model_path) const {
+    if (m_resid_dist_sum.empty() || m_resid_n_layer <= 0) {
+        LOG_WRN("%s: no residual-stream data captured (no 'l_out-*' tensors seen)\n", __func__);
+        return;
+    }
+    const int final_layer = m_resid_n_layer - 1;
+
+    // mean angular distance d(start, n) for a block size, averaged over the calibration set
+    auto mean_dist = [&](size_t b, int start) -> double {
+        if (b >= m_resid_dist_cnt.size() || start < 0 || (int) m_resid_dist_cnt[b].size() <= start) {
+            return -1.0;
+        }
+        const int64_t c = m_resid_dist_cnt[b][start];
+        return c > 0 ? m_resid_dist_sum[b][start] / (double) c : -1.0;
+    };
+
+    // budget index 0 is n=1 (adjacent) -> use it for the per-layer table
+    std::vector<std::pair<int,double>> adj; // (layer l, d(l-1,1)) i.e. influence of layer l
+    for (int start = 0; start + 1 <= final_layer; ++start) {
+        const double d = mean_dist(0, start);
+        if (d >= 0.0) { adj.emplace_back(start + 1, d); }
+    }
+
+    // for each real block budget, pick the contiguous block whose removal turns the
+    // residual stream through the smallest angle, never overlapping the final layer
+    auto best_block = [&](size_t b, int n) -> std::vector<int> {
+        double best = 1e9; int best_start = -1;
+        for (int start = 1; start + n - 1 < final_layer; ++start) { // keep layer 0 and the final block
+            const double d = mean_dist(b, start);
+            if (d >= 0.0 && d < best) { best = d; best_start = start; }
+        }
+        std::vector<int> picks;
+        if (best_start >= 0) {
+            for (int i = 0; i < n; ++i) { picks.push_back(best_start + i); }
+        }
+        return picks;
+    };
+
+    const std::string path = model_path + ".residual.layerinfo.json";
+    std::ofstream f(path);
+    if (!f) {
+        LOG_ERR("%s: failed to write %s\n", __func__, path.c_str());
+        return;
+    }
+    f << "{\n  \"model\": \"" << model_path << "\",\n";
+    f << "  \"method\": \"residual-stream-angular-distance\",\n";
+    f << "  \"n_embd\": " << m_resid_n_embd << ",\n";
+    f << "  \"n_layer\": " << m_resid_n_layer << ",\n";
+    f << "  \"layers\": [\n";
+    for (size_t i = 0; i < adj.size(); ++i) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "    { \"layer\": %d, \"bi\": %.6f }%s\n",
+                 adj[i].first, adj[i].second, i + 1 < adj.size() ? "," : "");
+        f << buf;
+    }
+    f << "  ],\n  \"recommended_skip\": {\n";
+    bool first = true;
+    for (size_t b = 0; b < m_resid_budgets.size(); ++b) {
+        const int n = m_resid_budgets[b];
+        if (n < 2) { continue; } // n=1 is the adjacent table above
+        const auto p = best_block(b, n);
+        if (!first) { f << ",\n"; }
+        first = false;
+        f << "    \"" << n << "\": [";
+        for (size_t i = 0; i < p.size(); ++i) { f << (i ? "," : "") << p[i]; }
+        f << "]";
+    }
+    f << "\n  }\n}\n";
+    LOG_INF("%s: wrote residual-stream layer importance (angular distance) to %s\n", __func__, path.c_str());
 }
 
 void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
@@ -1341,6 +1515,8 @@ int main(int argc, char ** argv) {
     params.cb_eval_user_data = NULL;
     params.warmup = false;
 
+    g_collector.set_collect_residual(params.residual_importance);
+
     // init
     auto llama_init = common_init_from_params(params);
 
@@ -1369,6 +1545,10 @@ int main(int argc, char ** argv) {
     }
 
     g_collector.save_imatrix();
+
+    if (params.residual_importance) {
+        g_collector.write_residual_sidecar(params.model.path);
+    }
 
     LOG("\n");
     llama_perf_context_print(ctx);

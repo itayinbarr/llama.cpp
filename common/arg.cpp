@@ -2791,6 +2791,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--residual-importance"},
+        string_format("during the imatrix pass, also capture per-layer residual-stream Block Influence "
+                      "(true cosine distance of the residual across each block) and write a "
+                      "<model>.residual.layerinfo.json sidecar for --skip-layers selection (default: %s)",
+                      params.residual_importance ? "true" : "false"),
+        [](common_params & params) {
+            params.residual_importance = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--parse-special"},
         string_format("parse special tokens (chat, tool, etc) (default: %s)", params.parse_special ? "true" : "false"),
         [](common_params & params) {
