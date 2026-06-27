@@ -1182,6 +1182,10 @@ static bool show_statistics(const common_params & params) {
     LOG_INF("\nComputing weighted average statistics per layer (%d layers)\n", layers);
     LOG_INF("\n%s\t%s\t%s\t%s\n", "  Layer", "     μΣ(Act²)", "      μZD", "μCosSim");
     LOG_INF("================================================\n");
+
+    // collect per-layer importance for the layerinfo sidecar
+    struct layer_info { int layer; float bias; float zd; float cossim; };
+    std::vector<layer_info> infos;
     for (const auto & [first, second] : ws) {
         const auto & layer = first;
         const auto & stats = second;
@@ -1196,9 +1200,65 @@ static bool show_statistics(const common_params & params) {
             const float cossim = stats.weighted_cossim / stats.total_elements;
 
             LOG_INF("%5d\t%14.2f\t%10.4f%%\t%6.4f\n", layer, bias, 100.0f * zd, cossim);
+            infos.push_back({ layer, bias, zd, cossim });
         }
     }
     LOG_INF("\n");
+
+    // emit a <model>.layerinfo.json sidecar with per-layer scores and recommended
+    // skip-lists at several budgets. Block Influence BI = 1 - cossim; a low-BI (high
+    // cossim) layer barely rotates the residual stream and is the best skip candidate.
+    // The final (highest-index) block is never recommended (it carries the readout).
+    if (!infos.empty() && !params.model.path.empty()) {
+        int max_layer = 0;
+        for (const auto & in : infos) { max_layer = std::max(max_layer, in.layer); }
+
+        // rank skip candidates by descending cossim (ascending BI), excluding the final block
+        std::vector<layer_info> cand;
+        for (const auto & in : infos) { if (in.layer != max_layer) { cand.push_back(in); } }
+        std::sort(cand.begin(), cand.end(), [](const layer_info & a, const layer_info & b) {
+            return a.cossim > b.cossim; // most redundant first
+        });
+
+        auto skip_list_at = [&](size_t budget) {
+            std::vector<int> picks;
+            for (size_t i = 0; i < budget && i < cand.size(); ++i) { picks.push_back(cand[i].layer); }
+            std::sort(picks.begin(), picks.end());
+            return picks;
+        };
+
+        const std::string path = params.model.path + ".layerinfo.json";
+        std::ofstream f(path);
+        if (f) {
+            f << "{\n";
+            f << "  \"model\": \"" << params.model.path << "\",\n";
+            f << "  \"method\": \"imatrix-cosine-bi\",\n";
+            f << "  \"n_layer\": " << (max_layer + 1) << ",\n";
+            f << "  \"layers\": [\n";
+            for (size_t i = 0; i < infos.size(); ++i) {
+                const auto & in = infos[i];
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "    { \"layer\": %d, \"cossim\": %.6f, \"bi\": %.6f, \"zd\": %.6f, \"bias\": %.4f }%s\n",
+                    in.layer, in.cossim, 1.0f - in.cossim, in.zd, in.bias, i + 1 < infos.size() ? "," : "");
+                f << buf;
+            }
+            f << "  ],\n";
+            f << "  \"recommended_skip\": {\n";
+            const size_t budgets[] = { 2, 4, 8, 12 };
+            for (size_t bi = 0; bi < sizeof(budgets)/sizeof(budgets[0]); ++bi) {
+                const auto picks = skip_list_at(budgets[bi]);
+                f << "    \"" << budgets[bi] << "\": [";
+                for (size_t i = 0; i < picks.size(); ++i) { f << (i ? "," : "") << picks[i]; }
+                f << "]" << (bi + 1 < sizeof(budgets)/sizeof(budgets[0]) ? "," : "") << "\n";
+            }
+            f << "  }\n";
+            f << "}\n";
+            LOG_INF("Wrote layer-importance sidecar to %s\n", path.c_str());
+        } else {
+            LOG_ERR("Failed to write layer-importance sidecar to %s\n", path.c_str());
+        }
+    }
 
     return true;
 }
