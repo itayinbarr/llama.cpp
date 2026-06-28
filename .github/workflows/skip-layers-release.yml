@@ -1,0 +1,104 @@
+name: skip-layers-release
+
+# Builds prebuilt binaries for the runtime --skip-layers fork so people can try it
+# without compiling. Fires on a tag like `skip-layers-v0.1` or via manual dispatch.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'skip-layers-*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-cpu:
+    name: Linux x64 (CPU, portable)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+
+      - name: Build (portable CPU, all variants)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_CURL=OFF
+          cmake --build build --config Release -j $(nproc) \
+            --target llama-cli llama-server llama-completion llama-perplexity llama-imatrix llama-quantize
+
+      - name: Package
+        run: |
+          cp LICENSE build/bin/ 2>/dev/null || true
+          tar -czf llama-skip-layers-linux-x64-cpu.tar.gz -C build/bin .
+
+      - name: Publish release (create with CPU asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || format('skip-layers-build-{0}', github.run_number) }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          NOTES=$'Prebuilt binaries for the runtime `--skip-layers` fork of llama.cpp.\n\nLinux x64 CPU build (portable across CPU feature levels). For CUDA, see the CUDA asset if present, or build from source with `-DGGML_CUDA=ON` (required for RTX 50-series / Blackwell, which needs CUDA 12.8+).\n\nQuick try:\n```\ntar xzf llama-skip-layers-linux-x64-cpu.tar.gz\n./llama-cli -m your-model.gguf -p "hi" --skip-layers 20,22,24\n```'
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "skip-layers $TAG" \
+            --notes "$NOTES" \
+            llama-skip-layers-linux-x64-cpu.tar.gz \
+          || gh release upload "$TAG" llama-skip-layers-linux-x64-cpu.tar.gz --clobber
+
+  linux-cuda:
+    name: Linux x64 (CUDA, best-effort)
+    needs: linux-cpu
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+
+      - name: Build (CUDA, Turing..Hopper)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF
+          cmake --build build --config Release -j $(nproc) \
+            --target llama-cli llama-server llama-completion llama-perplexity llama-imatrix llama-quantize
+
+      - name: Package
+        run: |
+          cp LICENSE build/bin/ 2>/dev/null || true
+          tar -czf llama-skip-layers-linux-x64-cuda12.tar.gz -C build/bin .
+
+      - name: Attach CUDA asset to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || format('skip-layers-build-{0}', github.run_number) }}"
+          gh release upload "$TAG" llama-skip-layers-linux-x64-cuda12.tar.gz --clobber

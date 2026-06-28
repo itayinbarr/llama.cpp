@@ -1,3 +1,53 @@
+# 🦙✂️ llama.cpp with runtime `--skip-layers` (fork)
+
+> This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds a
+> **load-time** option to skip transformer blocks of a model you already have - real,
+> proportional memory savings, composing with whatever quantization is already in the GGUF,
+> with no re-baking and no second model on disk. Upstream only exposes depth pruning at
+> *bake* time (`--prune-layers`, mergekit, PruneMe); this does it at *run* time.
+
+## What's new here
+
+```bash
+# skip an explicit list of blocks at load
+llama-cli   -m model.gguf --skip-layers 20,22,24
+llama-server -m model.gguf --skip-layers 20,22,24
+
+# or let an importance sidecar choose the N least-influential blocks
+llama-imatrix -m model.gguf -f calib.txt --show-statistics   # writes model.gguf.layerinfo.json
+llama-cli   -m model.gguf --skip-layers-budget 8
+```
+
+- `--skip-layers L0,L1,...` - skip those blocks; their weights are never allocated.
+- `--skip-layers-budget N` - skip the N least-influential blocks from a `<model>.layerinfo.json`
+  sidecar written by `llama-imatrix --show-statistics` (cosine importance) or
+  `--residual-importance` (residual-stream angular distance).
+- Works on dense models (in-memory remap) and the hybrid Qwen3 family
+  (`qwen35` / `qwen35moe`, in-graph pass-through). With the flag off, behavior is
+  bit-identical to upstream.
+
+## What I found (Qwen3-8B, wikitext-2)
+
+- **Selection matters far more than count.** Skipping 8 importance-chosen blocks keeps
+  perplexity near 30; skipping the 8 *deepest* blocks sends it to 1260 - same budget, ~40x
+  the damage.
+- **Memory drops proportionally** (~110 MiB of weights per block, plus KV/compute), and
+  composes on top of quantization. Skipping a quarter of a 27B's blocks let an IQ2 build that
+  OOM'd on 8 GB load and run.
+- **Don't trust a published drop-list across model families.** The residual-stream angular
+  metric that works on Llama (5x perplexity at skip 8) is catastrophic on Qwen3 (91x); the
+  activation-cosine metric is the reliable one here. Validate per model.
+
+Prebuilt binaries are on the [Releases](https://github.com/itayinbarr/llama.cpp/releases) tab
+(Linux CPU; CUDA when the build succeeds). For other platforms or newer GPUs, build from
+source as usual with `-DGGML_CUDA=ON`.
+
+> Note: this fork is a personal experiment. The implementation was written with AI assistance
+> and is not affiliated with or endorsed by the upstream maintainers. It is **not** submitted
+> upstream; it is here for people who want to try the runtime-skip idea today.
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
